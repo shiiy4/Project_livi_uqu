@@ -1,98 +1,81 @@
-import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report
 from flask import Flask, request, jsonify
 import joblib
+import numpy as np
+import torch
+from transformers import BertTokenizer, BertModel
 
-# إعداد Flask
 app = Flask(__name__)
 
-# 1. إعداد البيانات وتدريب النموذج
-data_file = "answers_classification_dataset.csv"  # ملف الإجابات المصنفة مسبقًا
-df = pd.read_csv(data_file)
+# ✅ تحميل النموذج والمكونات المحفوظة
+classifier = joblib.load("random_forest_model_tfidf_bert.pkl")  # نموذج التصنيف الجديد
+tfidf_vectorizer = joblib.load("tfidf_vectorizer.pkl")
+keyword_dict = joblib.load("keyword_dict.pkl")
+tokenizer = joblib.load("bert_tokenizer.pkl")  # تحميل BERT tokenizer
+model = joblib.load("bert_model.pkl")  # تحميل BERT model
 
-# التحقق من شكل البيانات
-print("First 5 rows of the dataset:")
-print(df.head())
+def get_bert_embeddings(text):
+    """تحويل الجملة إلى تمثيل عددي باستخدام BERT"""
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
 
-# فصل الميزات (الإجابات) والهدف (التصنيف)
-X = df["Answer"]  # الإجابة النصية
-y = df["Label"]   # التصنيف (Positive/Negative)
+def classify_text(text):
+    """تصنيف الجملة بناءً على الكلمات المفتاحية أو باستخدام TF-IDF + BERT"""
+    words = text.lower().split()
+    
+    # ✅ البحث عن الكلمات المفتاحية في الجملة
+    detected_categories = [keyword_dict[word] for word in words if word in keyword_dict]
 
-# تحويل النصوص إلى ميزات عددية باستخدام TF-IDF
-vectorizer = TfidfVectorizer()
-X_transformed = vectorizer.fit_transform(X)
+    if detected_categories:
+        # إذا تم العثور على كلمات مفتاحية، يتم التصنيف بناءً على أكثر الكلمات تكرارًا
+        prediction = max(set(detected_categories), key=detected_categories.count)
+        return prediction
 
-# تقسيم البيانات إلى تدريب واختبار
-X_train, X_test, y_train, y_test = train_test_split(X_transformed, y, test_size=0.2, random_state=42, stratify=y)
+    # ✅ إذا لم تكن هناك كلمات مفتاحية، نستخدم TF-IDF + BERT مع النموذج المدرب
+    X_tfidf = tfidf_vectorizer.transform([text]).toarray()  # استخراج ميزات TF-IDF
+    X_bert = get_bert_embeddings(text).reshape(1, -1)  # استخراج ميزات BERT
+    X_combined = np.hstack((X_tfidf, X_bert))  # دمج الميزات
 
-# تدريب نموذج Random Forest
-model = RandomForestClassifier(n_estimators=200, random_state=42, class_weight="balanced")
-model.fit(X_train, y_train)
+    prediction = classifier.predict(X_combined)[0]  # التنبؤ النهائي
+    return prediction
 
-# تقييم النموذج
-y_pred = model.predict(X_test)
-print("\nClassification Report:")
-print(classification_report(y_test, y_pred))
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    data = request.json
+    user_answers = data.get("answers", [])
 
-# حفظ النموذج و TF-IDF Vectorizer لاستخدامهما لاحقًا
-joblib.dump(model, "answer_classifier.pkl")
-joblib.dump(vectorizer, "tfidf_vectorizer.pkl")
-print("\nModel and vectorizer saved successfully!")
+    if not user_answers or len(user_answers) != 20:
+        return jsonify({"error": "Exactly 20 answers are required"}), 400
 
-# 2. إنشاء API باستخدام Flask
-@app.route('/analyze', methods=['POST'])
-def analyze_answers():
-    try:
-        # تحميل النموذج والمدخلات
-        model = joblib.load("answer_classifier.pkl")
-        vectorizer = joblib.load("tfidf_vectorizer.pkl")
-        
-        # قراءة البيانات من الطلب
-        data = request.json
-        answers = data.get("answers")  # قائمة الإجابات من المستخدم
+    negative_count = 0
+    total_answers = len(user_answers)  # عدد الإجابات (يجب أن يكون 20)
+    results = []
 
-        if not answers or len(answers) != 20:
-            return jsonify({
-                "status": "error",
-                "message": "Exactly 20 answers are required."
-            }), 400
+    for answer in user_answers:
+        prediction = classify_text(answer)
+        label = "Positive" if prediction == "Positive" else "Negative"
+        results.append({"answer": answer, "classification": label})
 
-        # تحويل الإجابات إلى ميزات باستخدام TF-IDF
-        features = vectorizer.transform(answers)
+        if prediction == "Negative":
+            negative_count += 1
 
-        # تصنيف كل إجابة
-        predictions = model.predict(features)
+    # ✅ تحسين طريقة التشخيص بناءً على النسبة وليس العدد فقط
+    negative_ratio = negative_count / total_answers  # نسبة الإجابات السلبية
 
-        # حساب عدد الإجابات الإيجابية والسلبية
-        positive_count = sum(1 for p in predictions if p == "Positive")
-        negative_count = sum(1 for p in predictions if p == "Negative")
+    if negative_ratio <= 0.35:  # 7/20 = 0.35
+        diagnosis = "Normal"
+    elif 0.36 <= negative_ratio <= 0.50:  # 8/20 إلى 10/20
+        diagnosis = "Need Monitoring"
+    else:  # 11/20 فأكثر
+        diagnosis = "At Risk"
 
-        # تحديد التشخيص بناءً على عدد الإجابات السلبية
-        if negative_count <= 7:
-            diagnosis = "Normal"
-        elif 8 <= negative_count <= 10:
-            diagnosis = "Needs Monitoring"
-        else:
-            diagnosis = "At Risk"
+    return jsonify({
+        "negative_answers": negative_count,
+        "negative_ratio": round(negative_ratio, 2),  # إظهار النسبة المئوية للإجابات السلبية
+        "diagnosis": diagnosis,
+        "detailed_results": results
+    })
 
-        # إعداد النتيجة
-        result = {
-            "status": "success",
-            "positive_count": positive_count,
-            "negative_count": negative_count,
-            "diagnosis": diagnosis  # إضافة التشخيص النهائي
-        }
-
-        return jsonify(result), 200
-
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
-
-if __name__ == '__main__':
-    app.run(debug=True, host="0.0.0.0", port=5000)
+if __name__ == "__main__":
+    app.run(debug=True)
